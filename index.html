@@ -902,22 +902,87 @@ const DEFAULTS = {
 };
 
 const KEY='grande_site_v1';
+const FB_CONFIG={
+  apiKey:"AIzaSyDDgS1F8kd0HBsWTdIRHgR9mclsCpchNKQ",
+  authDomain:"grande-pizza-b7de4.firebaseapp.com",
+  projectId:"grande-pizza-b7de4",
+  storageBucket:"grande-pizza-b7de4.firebasestorage.app",
+  messagingSenderId:"476884980446",
+  appId:"1:476884980446:web:65e9cacda4c863a117e84f"
+};
+let FS=null, CLOUD=false, cloudErr='';
+const local={
+  get(){ try{ const v=localStorage.getItem(KEY); return v?JSON.parse(v):null; }catch(e){ return null; } },
+  set(d){ try{ localStorage.setItem(KEY,JSON.stringify(d)); }catch(e){} }
+};
 const store={
   async get(){
     try{ if(window.storage){ const r=await window.storage.get(KEY); if(r&&r.value) return JSON.parse(r.value);} }catch(e){}
-    try{ const v=localStorage.getItem(KEY); if(v) return JSON.parse(v); }catch(e){}
-    return null;
+    return local.get();
   },
   async set(d){
-    const s=JSON.stringify(d);
-    try{ if(window.storage){ await window.storage.set(KEY,s); } }catch(e){}
-    try{ localStorage.setItem(KEY,s); }catch(e){}
+    const j=JSON.stringify(d);
+    try{ if(window.storage){ await window.storage.set(KEY,j); } }catch(e){}
+    local.set(d);
   }
 };
+async function cloudInit(){
+  try{
+    const [{initializeApp},fs]=await Promise.all([
+      import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js'),
+      import('https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js')
+    ]);
+    const app=initializeApp(FB_CONFIG);
+    const db=fs.initializeFirestore(app,{localCache:fs.persistentLocalCache({tabManager:fs.persistentMultipleTabManager()})});
+    FS={db,...fs};
+    CLOUD=true;
+    return true;
+  }catch(e){ cloudErr=e.message||'offline'; CLOUD=false; return false; }
+}
+async function cloudPullMenu(){
+  const snap=await FS.getDoc(FS.doc(FS.db,'shop','menu'));
+  return snap.exists()? snap.data() : null;
+}
+async function cloudPushMenu(){
+  const {settings,categories,items,addons,branches}=DB;
+  await FS.setDoc(FS.doc(FS.db,'shop','menu'),{settings,categories,items,addons,branches,at:Date.now()});
+}
+async function cloudAddOrder(o){
+  await FS.setDoc(FS.doc(FS.db,'orders',o.id),o);
+}
+async function cloudSaveOrder(o){
+  await FS.setDoc(FS.doc(FS.db,'orders',o.id),o,{merge:true});
+}
+async function cloudDeleteOrder(id){
+  await FS.deleteDoc(FS.doc(FS.db,'orders',id));
+}
+function cloudWatchOrders(){
+  const q=FS.query(FS.collection(FS.db,'orders'),FS.orderBy('at','desc'),FS.limit(200));
+  FS.onSnapshot(q,snap=>{
+    const list=snap.docs.map(d=>d.data());
+    const grew=list.length>DB.orders.length;
+    const fresh=list.filter(o=>!o.seen).length>DB.orders.filter(o=>!o.seen).length;
+    DB.orders=list; lastCheck=Date.now(); lastCount=list.length;
+    local.set(DB);
+    if(grew||fresh){ if(DB.settings.sound!==false) beep(); toast('New order received'); }
+    renderBadges();
+    if(ADMIN_IN && $('#admin').classList.contains('on') && ['notify','orders','dash'].includes(AD_TAB)) drawAdmin();
+  },err=>{ cloudErr=err.message; });
+}
+function cloudWatchMenu(){
+  FS.onSnapshot(FS.doc(FS.db,'shop','menu'),snap=>{
+    if(!snap.exists()||snap.metadata.hasPendingWrites) return;
+    const d=snap.data();
+    DB.settings=Object.assign({},DEFAULTS.settings,d.settings||{});
+    ['categories','items','addons','branches'].forEach(k=>{ if(Array.isArray(d[k])) DB[k]=d[k]; });
+    local.set(DB);
+    if($('#admin').classList.contains('on')) drawAdmin(); else renderAll();
+  },err=>{ cloudErr=err.message; });
+}
 let DB = JSON.parse(JSON.stringify(DEFAULTS));
 let CART = [];
 let ADMIN_IN = false;
-const save = () => store.set(DB);
+const save = () => { store.set(DB); if(CLOUD) cloudPushMenu().catch(e=>{cloudErr=e.message;}); };
 const money = n => (n===0? 'MRP' : DB.settings.currency+' '+Number(n).toLocaleString('en-LK'));
 const esc = s => String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const $ = s => document.querySelector(s);
@@ -1178,10 +1243,12 @@ function sendOrder(type){
   if(type==='Delivery'&&!addr){ toast('Add the delivery address'); return; }
   const sub=cartSub(), fee=(type==='Delivery'&&sub<DB.settings.freeOver)?DB.settings.deliveryFee:0;
   const no = (DB.settings.orderNo = (DB.settings.orderNo||1000) + 1);
-  DB.orders.unshift({id:uid('o'),no,at:Date.now(),name,phone,type,branch,addr,note,
+  const order={id:uid('o'),no,at:Date.now(),name,phone,type,branch,addr,note,
     items:CART.map(l=>({name:l.name,qty:l.qty,total:lineTotal(l),opts:l.opts.map(o=>o.name)})),
-    total:sub+fee,status:'new',seen:false});
+    total:sub+fee,status:'new',seen:false};
+  DB.orders.unshift(order);
   save();
+  if(CLOUD) cloudAddOrder(order).catch(e=>{cloudErr=e.message;});
   CART=[];
   $('#cartCount').textContent='0'; $('#cartCount').style.display='none'; $('#mbar').classList.remove('show');
   $('#cartBody').innerHTML=`<div style="text-align:center;padding:34px 8px">
@@ -1278,7 +1345,15 @@ function renderBadges(){
   }
 }
 async function syncOrders(){
-  const saved=await store.get(); lastCheck=Date.now();
+  lastCheck=Date.now();
+  if(CLOUD){
+    try{
+      const snap=await FS.getDocs(FS.query(FS.collection(FS.db,'orders'),FS.orderBy('at','desc'),FS.limit(200)));
+      DB.orders=snap.docs.map(d=>d.data()); lastCount=DB.orders.length; local.set(DB); renderBadges();
+    }catch(e){ cloudErr=e.message; }
+    return;
+  }
+  const saved=await store.get();
   if(!saved||!Array.isArray(saved.orders)) return;
   if(saved.orders.length!==DB.orders.length){
     const grew = saved.orders.length>DB.orders.length;
@@ -1328,6 +1403,7 @@ function adDash(){
     <div class="stat"><b>${DB.orders.length}</b><span>Orders received</span></div>
     <div class="stat"><b>${money(rev)}</b><span>Order value</span></div>
     <div class="stat"><b>${off}</b><span>Sold out</span></div>
+    <div class="stat" style="${CLOUD?'':'border-color:rgba(214,32,44,.5)'}"><b style="font-size:19px;${CLOUD?'color:#7BD79A':'color:#FF8B84'}">${CLOUD?'Connected':'Offline'}</b><span>Cloud database</span></div>
     <div class="stat" style="${unseen()?'border-color:rgba(214,32,44,.5)':''}"><b style="${unseen()?'color:#FF8B84':''}">${unseen()}</b><span>Unread orders</span></div>
   </div>
   <div class="panel" style="display:none" id="mMeterWrap"><h3>Storage</h3><p class="ph">How much room is left for menu photos.</p><div id="mMeter"></div></div>
@@ -1543,7 +1619,7 @@ function adBranches(){
 function adOrders(){
   H(`<h2>Orders</h2><p class="hint">Everything placed on the site, newest first. Leave this screen open in the shop and it keeps itself up to date.</p>
   <div class="ordbar">
-    <span class="pill-live"><i></i>Live · last checked ${new Date(lastCheck).toLocaleTimeString('en-GB')}</span>
+    <span class="pill-live" style="${CLOUD?'':'border-color:rgba(214,32,44,.45)'}"><i style="${CLOUD?'':'background:var(--pomodoro);animation:none'}"></i>${CLOUD?'Live on the cloud':'Offline — this device only'} · ${new Date(lastCheck).toLocaleTimeString('en-GB')}</span>
     <button class="btn btn--sm" id="oRefresh"><span>Refresh now</span></button>
     <span style="color:var(--dim);font-size:13px">${unseen()? unseen()+' unread':'All caught up'}</span>
   </div>
@@ -1565,15 +1641,15 @@ function adOrders(){
       <button class="btn btn--danger btn--sm" data-odel="${o.id}"><span>Delete</span></button></div></div>`).join('')
   :`<div class="empty">No orders yet.</div>`}`);
   $('#oRefresh').onclick=async()=>{ await syncOrders(); drawAdmin(); toast('Checked for new orders'); };
-  $$('[data-st]').forEach(b=>b.onclick=()=>{const [id,st]=b.dataset.st.split('|');const o=DB.orders.find(x=>x.id===id);o.status=st;o.seen=true;save();drawAdmin();});
-  $$('[data-odel]').forEach(b=>b.onclick=()=>{if(confirm('Delete this order?')){DB.orders=DB.orders.filter(o=>o.id!==b.dataset.odel);save();drawAdmin();}});
+  $$('[data-st]').forEach(b=>b.onclick=()=>{const [id,st]=b.dataset.st.split('|');const o=DB.orders.find(x=>x.id===id);o.status=st;o.seen=true;store.set(DB);if(CLOUD)cloudSaveOrder(o);drawAdmin();});
+  $$('[data-odel]').forEach(b=>b.onclick=()=>{if(confirm('Delete this order?')){const id=b.dataset.odel;DB.orders=DB.orders.filter(o=>o.id!==id);store.set(DB);if(CLOUD)cloudDeleteOrder(id);drawAdmin();}});
 }
 
 function adNotify(){
   const list=DB.orders.slice(0,50), un=unseen();
   H(`<h2>Notifications</h2><p class="hint">Every order lands here first. The red number beside “Notifications” is how many you haven't opened yet.</p>
   <div class="ordbar">
-    <span class="pill-live"><i></i>Watching for new orders · checked ${new Date(lastCheck).toLocaleTimeString('en-GB')}</span>
+    <span class="pill-live" style="${CLOUD?'':'border-color:rgba(214,32,44,.45)'}"><i style="${CLOUD?'':'background:var(--pomodoro);animation:none'}"></i>${CLOUD?'Live on the cloud':'Offline — this device only'} · checked ${new Date(lastCheck).toLocaleTimeString('en-GB')}</span>
     <button class="btn btn--sm" id="nRefresh"><span>Refresh now</span></button>
     ${un?`<button class="btn btn--ghost btn--sm" id="nRead"><span>Mark all as read</span></button>`:''}
     <label style="display:flex;gap:9px;align-items:center;margin-left:auto">
@@ -1590,9 +1666,9 @@ function adNotify(){
       <button class="btn btn--ghost btn--sm" data-goto="${o.id}"><span>Open</span></button></div>`).join('')
    :`<div class="empty">Nothing yet. A new order shows up here the second it's placed.</div>`}`);
   $('#nRefresh').onclick=async()=>{ await syncOrders(); drawAdmin(); toast('Checked for new orders'); };
-  if($('#nRead')) $('#nRead').onclick=()=>{ DB.orders.forEach(o=>o.seen=true); save(); drawAdmin(); toast('All marked as read'); };
+  if($('#nRead')) $('#nRead').onclick=()=>{ DB.orders.forEach(o=>{ if(!o.seen){ o.seen=true; if(CLOUD) cloudSaveOrder(o); } }); store.set(DB); drawAdmin(); toast('All marked as read'); };
   $('#nSound').onchange=e=>{ DB.settings.sound=e.target.checked; save(); if(e.target.checked) beep(); };
-  $$('[data-goto]').forEach(b=>b.onclick=()=>{ const o=DB.orders.find(x=>x.id===b.dataset.goto); if(o){o.seen=true;save();} AD_TAB='orders'; drawAdmin(); });
+  $$('[data-goto]').forEach(b=>b.onclick=()=>{ const o=DB.orders.find(x=>x.id===b.dataset.goto); if(o){o.seen=true;store.set(DB);if(CLOUD)cloudSaveOrder(o);} AD_TAB='orders'; drawAdmin(); });
 }
 
 function adSettings(){
@@ -1673,8 +1749,25 @@ $('#adLogout').onclick=()=>{ADMIN_IN=false;AD_TAB='dash';drawAdmin();};
   }
   lastCount=DB.orders.length;
   renderAll(); heroFX(); renderBadges();
-  setInterval(syncOrders, 8000);
-  window.addEventListener('storage', e=>{ if(e.key===KEY) syncOrders(); });
+
+  if(await cloudInit()){
+    try{
+      const menu=await cloudPullMenu();
+      if(menu){
+        DB.settings=Object.assign({},DEFAULTS.settings,menu.settings||{});
+        ['categories','items','addons','branches'].forEach(k=>{ if(Array.isArray(menu[k])) DB[k]=menu[k]; });
+      }else{
+        await cloudPushMenu();
+      }
+      DB.orders=[];
+      cloudWatchOrders(); cloudWatchMenu();
+      local.set(DB); renderAll(); renderBadges();
+    }catch(e){ cloudErr=e.message; CLOUD=false; }
+  }
+  if(!CLOUD){
+    setInterval(syncOrders, 8000);
+    window.addEventListener('storage', e=>{ if(e.key===KEY) syncOrders(); });
+  }
 })();
 </script>
 </body>
